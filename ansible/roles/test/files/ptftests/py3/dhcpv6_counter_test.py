@@ -26,6 +26,7 @@ DHCP6_RelayReply = scapy.layers.dhcp6.DHCP6_RelayReply
 DHCP6OptRelayMsg = scapy.layers.dhcp6.DHCP6OptRelayMsg
 DHCP6OptAuth = scapy.layers.dhcp6.DHCP6OptAuth
 DHCP6OptClientId = scapy.layers.dhcp6.DHCP6OptClientId
+DHCP6OptIfaceId = scapy.layers.dhcp6.DHCP6OptIfaceId
 DUID_LLT = scapy.layers.dhcp6.DUID_LLT
 
 
@@ -88,6 +89,22 @@ class DHCPCounterTest(DataplaneBaseTest):
         self.loopback_ipv6 = self.test_params['loopback_ipv6']
         self.reference = 0
 
+        # --- GPINS relay-mode parameters (optional; defaults == upstream behaviour) ---
+        # link_addr: Relay-Reply link-address ('::' for L3 + link-local only).
+        self.link_addr = self._param_or('link_addr', self.vlan_ip)
+        # relay_listen_ip: where the simulated server sends Relay-Reply.
+        self.relay_listen_ip = self._param_or(
+            'relay_listen_ip', self.loopback_ipv6 if self.is_dualtor else self.relay_iface_ip)
+        # interface_id: Option 18 the relay inserted; echoed back so the relay
+        # can pick the egress port when link-address is '::'.
+        self.interface_id = self._param_or('interface_id', None)
+
+    def _param_or(self, name, default):
+        value = self.test_params.get(name)
+        if value is None or value == 'None':
+            return default
+        return value
+
     def generate_client_interace_ipv6_link_local_address(self, client_port_index):
         # For DUALTOR Setup, flapping the link will disrupt ICMP HB communication and link health is impacted.
         # Skip this for DUALTOR.
@@ -105,7 +122,7 @@ class DHCPCounterTest(DataplaneBaseTest):
         proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE)
         stdout, stderr = proc.communicate()
 
-        return stdout.strip()
+        return stdout.decode().strip() if isinstance(stdout, bytes) else stdout.strip()
 
     def tearDown(self):
         DataplaneBaseTest.tearDown(self)
@@ -129,20 +146,29 @@ class DHCPCounterTest(DataplaneBaseTest):
         packet /= IPv6(src=self.client_link_local, dst=self.BROADCAST_IP)
         packet /= ptf.packet.UDP(sport=self.DHCP_CLIENT_PORT,
                                  dport=self.DHCP_SERVER_PORT)
-        # changes optcode to be out of client scope to test malformed counters
-        packet /= message(trid=12345)/DHCP6OptAuth(optcode=148)
+        # dhcp6relay: option codes > 147 (DHCPv6_OPTION_LIMIT) are malformed
+        # dhcpmon:    option codes > 150 (DHCPV6_OPTION_CODE_MAX) are malformed
+        # Note: IANA has assigned up to option 148 (OPTION_RELAY_PORT, RFC 8357),
+        # so dhcp6relay's limit of 147 is outdated. Both limits are hardcoded
+        # and will go stale as IANA assigns new codes.
+        # Use optcode=300 (well above both limits) to trigger malformed detection
+        packet /= message(trid=12345)/DHCP6OptAuth(optcode=300)
+        return packet
+
+    def _relay_reply_header(self, msgtype=13, with_iface_id=True):
+        """Ether/IPv6/UDP/Relay-Reply header as the DHCPv6 server would send it to this relay."""
+        packet = ptf.packet.Ether(dst=self.dut_mac)
+        packet /= IPv6(src=self.server_ip, dst=self.relay_listen_ip)
+        packet /= ptf.packet.UDP(sport=self.DHCP_SERVER_PORT,
+                                 dport=self.DHCP_SERVER_PORT)
+        packet /= DHCP6_RelayReply(msgtype=msgtype, linkaddr=self.link_addr,
+                                   peeraddr=self.client_link_local)
+        if with_iface_id and self.interface_id is not None:
+            packet /= DHCP6OptIfaceId(ifaceid=str(self.interface_id).encode())
         return packet
 
     def create_server_packet(self, message):
-        packet = ptf.packet.Ether(dst=self.dut_mac)
-        if self.is_dualtor:
-            packet /= IPv6(src=self.server_ip, dst=self.loopback_ipv6)
-        else:
-            packet /= IPv6(src=self.server_ip, dst=self.relay_iface_ip)
-        packet /= ptf.packet.UDP(sport=self.DHCP_SERVER_PORT,
-                                 dport=self.DHCP_SERVER_PORT)
-        packet /= DHCP6_RelayReply(msgtype=13, linkaddr=self.vlan_ip,
-                                   peeraddr=self.client_link_local)
+        packet = self._relay_reply_header()
         if self.reference % 3 == 0:
             packet /= DHCP6OptClientId(duid=DUID_LLT(lladdr=self.dut_mac))
         packet /= DHCP6OptRelayMsg(message=[message(trid=12345)])
@@ -152,18 +178,20 @@ class DHCPCounterTest(DataplaneBaseTest):
 
         return packet
 
-    def create_unknown_server_packet(self):
-        packet = ptf.packet.Ether(dst=self.dut_mac)
-        if self.is_dualtor:
-            packet /= IPv6(src=self.server_ip, dst=self.loopback_ipv6)
-        else:
-            packet /= IPv6(src=self.server_ip, dst=self.relay_iface_ip)
-        packet /= ptf.packet.UDP(sport=self.DHCP_SERVER_PORT,
-                                 dport=self.DHCP_SERVER_PORT)
-        packet /= DHCP6_RelayReply(msgtype=13, linkaddr=self.vlan_ip,
-                                   peeraddr=self.client_link_local)
+    def create_malformed_server_packet(self):
+        """Relay-Reply with no relay-msg option.
+        dhcp6relay: counts as Unknown (unrecognizable inner content)
+        dhcpmon: counts as Malformed (relay packet missing required relay-msg option)
+        """
+        return self._relay_reply_header()
 
-        return packet
+    def create_unknown_server_packet(self):
+        """DHCPv6 packet with message type 20 (beyond valid range 1-13).
+        dhcp6relay: counts as Unknown (unrecognized message type)
+        dhcpmon: counts as Unknown (msg_type > RELAY_REPL)
+        """
+        # msgtype=20 is beyond the valid DHCPv6 range (1-13)
+        return self._relay_reply_header(msgtype=20, with_iface_id=False)
 
     """
      Send functions
@@ -191,6 +219,15 @@ class DHCPCounterTest(DataplaneBaseTest):
             testutils.send_packet(self, self.server_port_indices[0], packet)
             time.sleep(1)
 
+        # malformed: valid Relay-Reply but missing relay-msg option
+        malformed_packet = self.create_malformed_server_packet()
+        malformed_packet.src = self.dataplane.get_mac(
+            0, self.server_port_indices[0])
+        testutils.send_packet(
+            self, self.server_port_indices[0], malformed_packet)
+        time.sleep(1)
+
+        # unknown: DHCPv6 packet with unrecognized message type (20)
         unknown_packet = self.create_unknown_server_packet()
         unknown_packet.src = self.dataplane.get_mac(
             0, self.server_port_indices[0])
