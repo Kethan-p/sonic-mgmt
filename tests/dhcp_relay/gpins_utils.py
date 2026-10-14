@@ -475,7 +475,7 @@ def build_dhcp_relay_fields(dhcpv6_servers, rfc6939_support=None, enable_interfa
     return fields
 
 
-def set_dhcp_relay_config(duthost, interface, dhcpv6_servers, replace=True, **options):
+def set_dhcp_relay_config(duthost, interface, dhcpv6_servers, replace=True, relay_mode=None, **options):
     """Enable DHCPv6 relay on an interface by writing CONFIG_DB DHCP_RELAY|<interface>.
 
     Args:
@@ -486,11 +486,16 @@ def set_dhcp_relay_config(duthost, interface, dhcpv6_servers, replace=True, **op
         dhcpv6_servers: server address or list of addresses.
         replace: if True, delete the existing entry first so stale options
             from a previous test do not leak into this one.
+        relay_mode: optional relay mode ('vlan'/'svi', 'l3_lla', 'l3_gua'); when
+            given, asserts ``interface`` matches that mode (e.g. has no GUA in
+            ``l3_lla`` mode) before writing ``DHCP_RELAY|<interface>``.
         **options: see ``build_dhcp_relay_fields``. On an interface without a
             GUA (l3_lla) the relay manager rejects the entry unless
             ``enable_interface_id=True`` and ``interface_id`` is locally unique;
             a rejected entry never appears in STATE_DB.
     """
+    if relay_mode is not None:
+        verify_interface_mode(duthost, interface, relay_mode)
     key = "DHCP_RELAY|{}".format(interface)
     fields = build_dhcp_relay_fields(dhcpv6_servers, **options)
     if replace:
@@ -1112,6 +1117,79 @@ def get_port_link_local(duthost, port):
     return with_prefix.split("/")[0], with_prefix
 
 
+def get_port_kernel_guas(duthost, port):
+    """Return list of global-scope IPv6 CIDRs (``['2001:db8:1::1/64', ...]``) on the kernel netdev for ``port``."""
+    cmd = "ip -6 addr show dev {} scope global | awk '/inet6/ {{print $2}}'".format(
+        shlex.quote(to_kernel_ifname(port)))
+    res = duthost.shell(cmd, module_ignore_errors=True, verbose=False)
+    if res.get("rc", 1) != 0:
+        return []
+    return [line.strip() for line in res.get("stdout", "").splitlines() if line.strip()]
+
+
+def check_interface_mode(duthost, interface, mode, ports=None):
+    """Verify ``interface`` matches the expected relay ``mode`` ('vlan'/'svi', 'l3_lla', 'l3_gua').
+
+    Returns ``(ok, reason)``:
+      * ``vlan`` (``svi``): ``interface`` is a VLAN interface (``Vlan*``) present in
+        CONFIG_DB ``VLAN`` and the kernel, with at least one physical member and
+        an IPv6 GUA in ``VLAN_INTERFACE`` and on the kernel netdev.
+      * ``l3_gua``: ``interface`` is a physical L3 port in CONFIG_DB ``PORT`` (not a
+        VLAN or VLAN member) with both a link-local address and a global IPv6
+        address (GUA) in CONFIG_DB ``INTERFACE`` and on the kernel netdev.
+      * ``l3_lla``: ``interface`` is a physical L3 port in CONFIG_DB ``PORT`` (not a
+        VLAN or VLAN member) with a link-local address and *no* GUA in either
+        CONFIG_DB ``INTERFACE`` or on the kernel netdev.
+    """
+    mode = normalize_relay_mode(mode)
+    if mode == RELAY_MODE_VLAN:
+        if not str(interface).startswith("Vlan"):
+            return False, "{} is not a VLAN interface (mode={})".format(interface, mode)
+        vlans = get_vlans(duthost)
+        if interface not in vlans:
+            return False, "{} is not present in CONFIG_DB VLAN table".format(interface)
+        members = [m for m in vlans[interface]["members"] if not m.startswith("PortChannel")]
+        if not members:
+            return False, "{} has no physical VLAN_MEMBER ports".format(interface)
+        cfg_gua, _ = vlans[interface]["ipv6"]
+        if not cfg_gua:
+            return False, "{} has no IPv6 GUA in CONFIG_DB VLAN_INTERFACE".format(interface)
+        return True, ""
+
+    if str(interface).startswith("Vlan"):
+        return False, "{} is a VLAN interface, expected L3 physical port for mode={}".format(interface, mode)
+    ports = ports if ports is not None else get_ports(duthost)
+    if ports and interface not in ports:
+        return False, "{} is not in CONFIG_DB PORT table".format(interface)
+    sep = _db_separator("CONFIG_DB")
+    vlan_memberships = redis_keys(duthost, "CONFIG_DB", "VLAN_MEMBER{}*{}{}".format(sep, sep, interface))
+    if vlan_memberships:
+        return False, "{} is a L2 VLAN member ({}), expected L3 port for mode={}".format(
+            interface, vlan_memberships, mode)
+
+    cfg_gua, _ = get_interface_ipv6(duthost, interface)
+    kernel_guas = get_port_kernel_guas(duthost, interface)
+
+    if mode == RELAY_MODE_L3_LLA:
+        if cfg_gua or kernel_guas:
+            return False, "{} must not have a GUA in l3_lla mode (CONFIG_DB GUA={}, kernel GUAs={})".format(
+                interface, cfg_gua, kernel_guas)
+        return True, ""
+
+    # mode == RELAY_MODE_L3_GUA
+    if not cfg_gua:
+        return False, "{} must have a GUA in l3_gua mode (CONFIG_DB GUA={})".format(
+            interface, cfg_gua)
+    return True, ""
+
+
+def verify_interface_mode(duthost, interface, mode, ports=None):
+    """Assert ``interface`` satisfies ``check_interface_mode(duthost, interface, mode)`` before enabling DHCP relay."""
+    ok, reason = check_interface_mode(duthost, interface, mode, ports=ports)
+    if not ok:
+        raise AssertionError("Interface {} does not match relay mode {}: {}".format(interface, mode, reason))
+
+
 def ptf_index_for_port(tbinfo, duthost, port_entry, port_name=None):
     """Map a CONFIG_DB PORT entry to its PTF port index.
 
@@ -1234,7 +1312,7 @@ def relay_targets(duthost, mode, ports=None, tbinfo=None, require_link=True):
     Returns a list of dicts ``{"relay_interface", "client_port", "gua", "gua_plen"}``:
       * vlan:   one per VLAN that has a physical member and an IPv6 VLAN_INTERFACE
       * l3_gua: one per downlink port with an IPv6 INTERFACE entry
-      * l3_lla: one per downlink port (GUA fields are None)
+      * l3_lla: one per downlink port that has *no* GUA in CONFIG_DB or the kernel
     With ``require_link`` (default) only downlinks that are oper up - and in the
     testbed's ``ptf_map`` when one is defined - are considered, so the first
     target is always a port the PTF can actually reach.
@@ -1265,7 +1343,9 @@ def relay_targets(duthost, mode, ports=None, tbinfo=None, require_link=True):
                 targets.append({"relay_interface": port, "client_port": port, "gua": addr, "gua_plen": plen})
     else:  # RELAY_MODE_L3_LLA
         for port in downlinks:
-            targets.append({"relay_interface": port, "client_port": port, "gua": None, "gua_plen": None})
+            addr, _ = get_interface_ipv6(duthost, port)
+            if addr is None and not get_port_kernel_guas(duthost, port):
+                targets.append({"relay_interface": port, "client_port": port, "gua": None, "gua_plen": None})
     logger.info("relay targets for mode %s: %s", mode, [t["relay_interface"] for t in targets])
     return targets
 
@@ -1308,12 +1388,22 @@ def configure_relay_mode(duthost, mode, ports=None, tbinfo=None):
         patterns = ["INTERFACE|{}|*".format(p) for p in downlinks]
         snap = snapshot_config_db(duthost, patterns)
         ipv6_keys = [k for k in snap["entries"] if ":" in k.rsplit("|", 1)[-1]]
+        removed_set = set()
         if ipv6_keys:
             state["snapshot"] = snap
             for key in ipv6_keys:
                 _, port, cidr = key.split("|", 2)
                 del_interface_ipv6(duthost, port, cidr)
                 state["removed_kernel_addrs"].append((port, cidr))
+                removed_set.add((port, cidr))
+        for port in downlinks[:2]:
+            for cidr in get_port_kernel_guas(duthost, port):
+                dev = to_kernel_ifname(port)
+                duthost.shell("ip -6 addr del {} dev {}".format(shlex.quote(cidr), shlex.quote(dev)),
+                              module_ignore_errors=True, verbose=False)
+                if (port, cidr) not in removed_set:
+                    state["removed_kernel_addrs"].append((port, cidr))
+                    removed_set.add((port, cidr))
         return True, "", state
 
     if mode == RELAY_MODE_L3_GUA:
@@ -1326,9 +1416,9 @@ def configure_relay_mode(duthost, mode, ports=None, tbinfo=None):
         state["snapshot"] = snapshot_config_db(duthost, patterns)
         for idx, port in enumerate(target_ports, start=1):
             addr, _ = get_interface_ipv6(duthost, port)
-            if addr:
+            if addr and get_port_kernel_guas(duthost, port):
                 continue
-            cidr = DEFAULT_L3_GUA_TEMPLATE.format(idx=idx)
+            cidr = "{}/{}".format(addr, _) if addr else DEFAULT_L3_GUA_TEMPLATE.format(idx=idx)
             set_interface_ipv6(duthost, port, cidr)
             state["added_kernel_addrs"].append((port, cidr))
         return True, "", state

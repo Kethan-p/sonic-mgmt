@@ -157,7 +157,7 @@ def test_dhcpv6_relay_config_convergence(duthosts, rand_one_dut_hostname, tbinfo
         if gpins_utils.get_dhcp_relay_config(duthost, intf):
             logger.info("%s already has a DHCP_RELAY entry outside the module baseline; skipping it", intf)
             continue
-        gpins_utils.set_dhcp_relay_config(duthost, intf, servers, **lla_options(data))
+        gpins_utils.set_dhcp_relay_config(duthost, intf, servers, relay_mode=relay_mode, **lla_options(data))
         wait_converged(duthost, intf)
         gpins_utils.del_dhcp_relay_config(duthost, intf)
         wait_state_cleared(duthost, intf)
@@ -179,12 +179,13 @@ def test_dhcpv6_relay_runtime_configuration(ptfhost, duthosts, rand_one_dut_host
     duthost = duthosts[rand_one_dut_hostname]
     dhcp_relay = dut_dhcp_relay_data[0]
     intf = dhcp_relay['relay_interface']
+    mode = dhcp_relay['relay_mode']
     original = servers_of(dhcp_relay)
     pid_before = gpins_utils.get_process_pid(duthost)
 
     # Add a server at runtime.
     updated = original + [EXTRA_DHCPV6_SERVER]
-    gpins_utils.set_dhcp_relay_config(duthost, intf, updated, **lla_options(dhcp_relay))
+    gpins_utils.set_dhcp_relay_config(duthost, intf, updated, relay_mode=mode, **lla_options(dhcp_relay))
     wait_converged(duthost, intf)
     state = gpins_utils.get_dhcp_relay_state(duthost, intf)
     pytest_assert(EXTRA_DHCPV6_SERVER in gpins_utils.parse_dhcpv6_servers(state),
@@ -197,7 +198,7 @@ def test_dhcpv6_relay_runtime_configuration(ptfhost, duthosts, rand_one_dut_host
                 "applied in place" if pid_before == pid_after else "daemon restarted")
 
     # Revert at runtime and prove the relay still works end to end.
-    applied = gpins_utils.set_dhcp_relay_config(duthost, intf, original, **lla_options(dhcp_relay))
+    applied = gpins_utils.set_dhcp_relay_config(duthost, intf, original, relay_mode=mode, **lla_options(dhcp_relay))
     wait_converged(duthost, intf)
     pytest_assert(gpins_utils.wait_dhcp6relay_bound(duthost, timeout=CONVERGE_TIMEOUT, interval=3),
                   "dhcp6relay not running/listening after reverting runtime config")
@@ -240,10 +241,18 @@ def test_dhcpv6_relay_disabled(duthosts, rand_one_dut_hostname, dut_dhcp_relay_d
 
 
 OPTION_CASES = {
-    "interface_id": {"enable_interface_id": True, "enable_remote_id": False},
-    "remote_id": {"enable_interface_id": False, "enable_remote_id": True, "remote_id": TEST_REMOTE_ID},
-    "both": {"enable_interface_id": True, "enable_remote_id": True, "remote_id": TEST_REMOTE_ID},
-    "none": {"enable_interface_id": False, "enable_remote_id": False},
+    "interface_id": {"enable_interface_id": True, "enable_remote_id": False, "rfc6939_support": True},
+    "interface_id_no_rfc6939": {"enable_interface_id": True, "enable_remote_id": False, "rfc6939_support": False},
+    "remote_id": {"enable_interface_id": False, "enable_remote_id": True, "remote_id": TEST_REMOTE_ID,
+                  "rfc6939_support": True},
+    "remote_id_no_rfc6939": {"enable_interface_id": False, "enable_remote_id": True, "remote_id": TEST_REMOTE_ID,
+                             "rfc6939_support": False},
+    "both": {"enable_interface_id": True, "enable_remote_id": True, "remote_id": TEST_REMOTE_ID,
+             "rfc6939_support": True},
+    "both_no_rfc6939": {"enable_interface_id": True, "enable_remote_id": True, "remote_id": TEST_REMOTE_ID,
+                        "rfc6939_support": False},
+    "none": {"enable_interface_id": False, "enable_remote_id": False, "rfc6939_support": True},
+    "none_no_rfc6939": {"enable_interface_id": False, "enable_remote_id": False, "rfc6939_support": False},
 }
 
 
@@ -251,7 +260,7 @@ OPTION_CASES = {
 def test_dhcpv6_relay_option_test(ptfhost, duthosts, rand_one_dut_hostname, dut_dhcp_relay_data,  # noqa F811
                                   validate_dut_routes_exist, dhcp_relay_config, dhcp_relay_config_snapshot,  # noqa F811
                                   option_case):
-    """Configure Interface-ID / Remote-ID combinations and check the Relay-Forward carries exactly those."""
+    """Configure Interface-ID / Remote-ID / RFC6939 combinations and check the Relay-Forward carries those."""
     duthost = duthosts[rand_one_dut_hostname]
     dhcp_relay = dut_dhcp_relay_data[0]
     intf = dhcp_relay['relay_interface']
@@ -263,12 +272,13 @@ def test_dhcpv6_relay_option_test(ptfhost, duthosts, rand_one_dut_hostname, dut_
         pytest.skip("LLA-only relay requires Interface-ID (design doc); case {!r} not applicable".format(
             option_case))
 
-    applied = gpins_utils.set_dhcp_relay_config(duthost, intf, servers_of(dhcp_relay), **options)
+    applied = gpins_utils.set_dhcp_relay_config(
+        duthost, intf, servers_of(dhcp_relay), relay_mode=dhcp_relay['relay_mode'], **options)
     wait_converged(duthost, intf)
     pytest_assert(gpins_utils.wait_dhcp6relay_bound(duthost, timeout=CONVERGE_TIMEOUT, interval=3),
                   "dhcp6relay not running/listening after applying option config {}".format(applied))
-    # The PTF verifier derives the expected Option 18 / 37 from ``applied``
-    # (see gpins_ptf_params): absent -> asserted absent (18) / not checked (37).
+    # The PTF verifier derives the expected Option 18 / 37 / 79 from ``applied``
+    # (see gpins_ptf_params): absent -> asserted absent (18) / skipped (37, 79).
     run_dhcptest(ptfhost, duthost, dhcp_relay, applied)
 
 

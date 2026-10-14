@@ -336,6 +336,7 @@ def dhcp_relay_config(duthosts, rand_one_dut_hostname, dut_dhcp_relay_data):
     created = []
     for dhcp_relay in dut_dhcp_relay_data:
         intf = dhcp_relay['relay_interface']
+        gpins_utils.verify_interface_mode(duthost, intf, dhcp_relay['relay_mode'])
         existing = gpins_utils.get_dhcp_relay_config(duthost, intf)
         if gpins_utils.parse_dhcpv6_servers(existing):
             logger.info("Using existing DHCP_RELAY|%s: %s", intf, existing)
@@ -345,7 +346,8 @@ def dhcp_relay_config(duthosts, rand_one_dut_hostname, dut_dhcp_relay_data):
         if dhcp_relay['relay_mode'] == gpins_utils.RELAY_MODE_L3_LLA:
             options = {"enable_interface_id": True, "interface_id": dhcp_relay['interface_id']}
         applied[intf] = gpins_utils.set_dhcp_relay_config(
-            duthost, intf, dhcp_relay['downlink_vlan_iface']['dhcpv6_server_addrs'], **options)
+            duthost, intf, dhcp_relay['downlink_vlan_iface']['dhcpv6_server_addrs'],
+            relay_mode=dhcp_relay['relay_mode'], **options)
         created.append(intf)
 
     if created:
@@ -380,6 +382,8 @@ def gpins_ptf_params(dhcp_relay, relay_cfg):
       routed to the loopback carried in Interface-ID).
     * interface_id / remote_id: the Option 18 / 37 values the DUT is expected
       to insert, derived from the applied CONFIG_DB entry (None = not expected).
+    * rfc6939_support: whether Option 79 (Client Link-Layer Address) is expected
+      in Relay-Forward (default True unless rfc6939_support == 'false').
     * downstream_reply_src_ip: source of the nested Relay-Reply the DUT forwards
       to a downstream relay; '' (don't care) when the port has no GUA.
     """
@@ -397,11 +401,14 @@ def gpins_ptf_params(dhcp_relay, relay_cfg):
     if relay_cfg.get("enable_remote_id", "").lower() == "true":
         remote_id = relay_cfg.get("remote_id")
 
+    rfc6939_support = str(relay_cfg.get("rfc6939_support", "true")).lower() != "false"
+
     return {
         "link_addr": str(gua) if gua else "::",
         "relay_listen_ip": str(gua) if gua else str(dhcp_relay['loopback_ipv6']),
         "interface_id": interface_id,
         "remote_id": remote_id,
+        "rfc6939_support": rfc6939_support,
         "downstream_reply_src_ip": str(gua) if gua else "",
     }
 
@@ -449,6 +456,7 @@ def unconfigured_relay_target(duthosts, rand_one_dut_hostname, tbinfo, relay_mod
         intf = target['relay_interface']
         if intf in configured or intf in dhcp_relay_table:
             continue
+        gpins_utils.verify_interface_mode(duthost, intf, relay_mode, ports=common['ports'])
         data = build_relay_data(duthost, tbinfo, relay_mode, target,
                                 dut_dhcp_relay_data[0]['downlink_vlan_iface']['dhcpv6_server_addrs'], common)
         pytest_assert(not gpins_utils.get_dhcp_relay_config(duthost, intf),
@@ -824,12 +832,13 @@ class TestDhcpv6RelayWithMultipleInterfaces:
         for target in targets:
             data = build_relay_data(duthost, tbinfo, relay_mode, target, servers, common)
             intf = data['relay_interface']
+            gpins_utils.verify_interface_mode(duthost, intf, relay_mode, ports=common['ports'])
             cfg = gpins_utils.get_dhcp_relay_config(duthost, intf)
             if not gpins_utils.parse_dhcpv6_servers(cfg):
                 options = {}
                 if relay_mode == gpins_utils.RELAY_MODE_L3_LLA:
                     options = {"enable_interface_id": True, "interface_id": data['interface_id']}
-                cfg = gpins_utils.set_dhcp_relay_config(duthost, intf, servers, **options)
+                cfg = gpins_utils.set_dhcp_relay_config(duthost, intf, servers, relay_mode=relay_mode, **options)
             data_list.append((data, cfg))
         pytest_assert(gpins_utils.wait_dhcp6relay_bound(duthost), "dhcp6relay is not running/listening")
         # Give the relay a moment to pick up the new entries (config convergence

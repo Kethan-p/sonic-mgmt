@@ -147,6 +147,10 @@ class DHCPTest(DataplaneBaseTest):
         self.interface_id = self._param_or('interface_id', None)
         # remote_id: expected Option 37 remote-id string. None -> not expected.
         self.remote_id = self._param_or('remote_id', None)
+        # rfc6939_support: whether Option 79 (Client Link-Layer Address) should be
+        #   checked in Relay-Forward (default True; False -> skip Option 79 check).
+        rfc6939_param = self._param_or('rfc6939_support', 'True')
+        self.rfc6939_support = str(rfc6939_param).lower() not in ('false', '0', 'no')
         # downstream_reply_src_ip: IPv6 source of the nested Relay-Reply the DUT
         #   forwards to downstream Relay A. Upstream: VLAN GUA. '' -> don't care
         #   (GPINS L3+LLA, where the relay has no GUA on the port).
@@ -222,7 +226,8 @@ class DHCPTest(DataplaneBaseTest):
             pkt /= DHCP6OptIfaceId(ifaceid=iface_id)
         if self.remote_id is not None:
             pkt /= DHCP6OptRemoteID(remoteid=str(self.remote_id).encode())
-        pkt /= DHCP6OptClientLinkLayerAddr()
+        if self.rfc6939_support:
+            pkt /= DHCP6OptClientLinkLayerAddr()
         return pkt
 
     def _server_relay_reply(self, inner_message):
@@ -455,7 +460,7 @@ class DHCPTest(DataplaneBaseTest):
             exp_remote = str(self.remote_id).encode()
             if len(remote_ids) != 1 or exp_remote not in remote_ids[0]:
                 return "Remote-ID %r != %r" % (remote_ids, self.remote_id)
-        if not has_clladdr:
+        if self.rfc6939_support and not has_clladdr:
             return "missing Client Link-Layer Address option (79)"
         return None
 
