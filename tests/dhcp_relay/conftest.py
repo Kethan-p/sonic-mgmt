@@ -4,7 +4,12 @@ import logging
 
 from tests.common.utilities import wait_until
 from tests.common.helpers.assertions import pytest_assert as py_assert
-from tests.common.dhcp_relay_utils import check_routes_to_dhcp_server
+try:
+    from tests.common.dhcp_relay_utils import check_routes_to_dhcp_server
+except ImportError:
+    from tests.dhcp_relay.dhcp_relay_utils import check_routes_to_dhcp_server
+from tests.dhcp_relay import gpins_dpb
+from tests.dhcp_relay import gpins_utils
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +48,219 @@ def pytest_addoption(parser):
         type=int,
         help="Set maximum packets per second for stress test",
     )
+    parser.addoption(
+        "--dhcp_relay_mode",
+        action="store",
+        default=",".join(gpins_utils.RELAY_MODES),
+        help="Comma-separated GPINS relay modes to run: {} (default: all). "
+             "Modes the DUT is not configured for are skipped.".format(", ".join(gpins_utils.RELAY_MODES)),
+    )
+    parser.addoption(
+        "--dhcp_relay_enable_feature",
+        action="store_true",
+        default=False,
+        help="Bring up DHCP relay for the session if it is not already: set FEATURE|dhcp_relay=enabled "
+             "(the GPINS relay only forwards while it is enabled) and start dhcprelay-con via its init "
+             "script (nothing on GPINS starts it from the flag). Both are reverted at session end. "
+             "Without this flag the directory is skipped when the relay is not up (upstream behaviour).",
+    )
+    parser.addoption(
+        "--dhcp_relay_static_route",
+        action="store",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="How relayed packets reach the DHCPv6 server without depending on bgp-con: 'auto' (default) "
+             "installs a static on-link route + neighbour toward the PTF behind the first uplink only when "
+             "the DUT has no route to the server; 'always' installs it unconditionally; 'never' requires an "
+             "existing (BGP) route. Entries are removed at module teardown.",
+    )
+    parser.addoption(
+        "--dhcp_relay_loopback_ipv6",
+        action="store",
+        default=gpins_utils.DEFAULT_LOOPBACK_IPV6,
+        help="IPv6 address/prefix to put on Loopback0 for the session if it has none (default {}). "
+             "dhcp6relay binds its loopback listen socket there once Interface-ID is enabled and exits "
+             "without it. 'none' disables the fixture.".format(gpins_utils.DEFAULT_LOOPBACK_IPV6),
+    )
+    # --- Dynamic Port Breakout (test_dhcpv6_relay_dpb_gpins.py). Only per-testbed values are options; the verified
+    # gNMI client, target, prefix and access recipe are constants in gpins_dpb.py.
+    parser.addoption(
+        "--dhcp_relay_dpb_parent",
+        action="store",
+        default=gpins_dpb.DEFAULT_PARENT,
+        help="Cage master port (lane 1, has a BREAKOUT_CFG row) to break out; must not be a test uplink or the "
+             "PTF downlink (default {}: an un-cabled spare on ju3u1m1).".format(gpins_dpb.DEFAULT_PARENT),
+    )
+    parser.addoption(
+        "--dhcp_relay_dpb_mode",
+        action="store",
+        default=gpins_dpb.DEFAULT_MODE,
+        help="Target breakout mode of the whole 8-lane cage in platform.json notation, e.g. '4x200G' or the "
+             "mixed '2x200G(4)+1x400G(4)' (default) which splits only the first 400G port.",
+    )
+    parser.addoption(
+        "--dhcp_relay_dpb_allow_root_replace",
+        action="store_true",
+        default=False,
+        help="Acknowledge that the breakout is a gNMI 'replace' at the root path (cage component + interfaces of the "
+             "new layout, as sonic-pins sends it). Evidence that it is safe: the UMF binary implements entry-level "
+             "partial replace ('Since its partial replace ...') and the request passed end to end on ju3u1m1; the "
+             "opt-in remains because a whole-config replace could take the management path with it. Without it "
+             "test_dpb_preflight and test_dhcpv6_relay_dpb skip.",
+    )
+    parser.addoption(
+        "--dhcp_relay_dpb_recovery",
+        action="store",
+        choices=("stack-restart", "none"),
+        default="stack-restart",
+        help="How to undo the breakout in the test's finally block: 'stack-restart' (default; gpins-stack restart "
+             "reloads config_db.json, then the pre-DPB snapshot is re-applied) or 'none' (leave the port layout "
+             "for manual inspection; CONFIG_DB/kernel session state is still re-applied).",
+    )
+    parser.addoption(
+        "--dhcp_relay_dpb_settle_timeout",
+        action="store",
+        type=int,
+        default=180,
+        help="Seconds to wait for the new ports in kernel/CONFIG_DB/APPL_DB after the gNMI Set (default 180).",
+    )
+
+
+def _selected_relay_modes(config):
+    raw = config.getoption("--dhcp_relay_mode") or ""
+    raw_modes = [m.strip() for m in raw.split(",") if m.strip()]
+    unknown = [m for m in raw_modes if m not in gpins_utils.RELAY_MODE_ALIASES]
+    if unknown:
+        raise pytest.UsageError("--dhcp_relay_mode: unknown mode(s) {}; expected {}".format(
+            unknown, list(gpins_utils.RELAY_MODES)))
+    modes = []
+    for m in raw_modes:
+        norm = gpins_utils.normalize_relay_mode(m)
+        if norm not in modes:
+            modes.append(norm)
+    return modes or list(gpins_utils.RELAY_MODES)
+
+
+def pytest_generate_tests(metafunc):
+    """Run every test that (transitively) uses ``relay_mode`` once per selected GPINS relay mode.
+
+    The test plan requires all DHCP-relay tests to be exercised in l3_lla,
+    l3_gua and vlan scenarios without writing separate tests per mode.
+    Module scope configures the DUT once per mode and keeps ``dut_dhcp_relay_data`` cached.
+    """
+    if "relay_mode" in metafunc.fixturenames:
+        metafunc.parametrize("relay_mode", _selected_relay_modes(metafunc.config), indirect=True, scope="module")
+
+
+@pytest.fixture(scope="module")
+def relay_mode(request, duthost, tbinfo):
+    """Configure the DUT for the GPINS relay mode under test (l3_lla / l3_gua / vlan) and tear it down after."""
+    mode = gpins_utils.normalize_relay_mode(request.param)
+    supported, reason, state = gpins_utils.configure_relay_mode(duthost, mode, tbinfo=tbinfo)
+    if not supported:
+        pytest.skip("relay mode not available on {}: {}".format(duthost.hostname, reason))
+    try:
+        yield mode
+    finally:
+        gpins_utils.teardown_relay_mode(duthost, state)
+
+
+DHCP_RELAY_FEATURE = gpins_utils.DHCP_RELAY_FEATURE
+DHCP_RELAY_FEATURE_START_TIMEOUT = 120
+
+
+@pytest.fixture(scope="session")
+def dhcp_relay_feature_enabled(request, duthost):
+    """Make sure DHCP relay is up for the session, if ``--dhcp_relay_enable_feature`` was given.
+
+    On GPINS two independent things must hold (verified on ju3u1m1, 2026-10-08):
+      1. ``FEATURE|dhcp_relay state=enabled`` - the relay manager only spawns
+         dhcp6relay while this is set; nothing else reads it.
+      2. ``dhcprelay-con`` running - started by ``/etc/init.d/dhcprelay-container``,
+         *not* by the flag (the image's hostcfgd has no feature handler).
+    Each is changed only if needed and each change is reverted at session end,
+    so a DUT that already had the relay up is left untouched.
+
+    Returns "enabled" when both hold, otherwise the FEATURE state found.
+    """
+    state = gpins_utils.feature_state(duthost, DHCP_RELAY_FEATURE)
+    relay_container = gpins_utils.DHCP_RELAY_CONTAINER
+    running = gpins_utils.is_container_running(duthost)
+    if state == "enabled" and running:
+        return "enabled"
+    if not request.config.getoption("--dhcp_relay_enable_feature"):
+        return state if running else "{} (container {} not running)".format(state, relay_container)
+
+    if state != "enabled":
+        logger.info("FEATURE|%s state=%r on %s; enabling for this session", DHCP_RELAY_FEATURE, state, duthost.hostname)
+        gpins_utils.set_feature_state(duthost, DHCP_RELAY_FEATURE, "enabled")
+
+        def _restore_flag():
+            logger.info("Restoring FEATURE|%s state=%r on %s", DHCP_RELAY_FEATURE, state, duthost.hostname)
+            gpins_utils.set_feature_state(duthost, DHCP_RELAY_FEATURE, state or "disabled")
+
+        request.addfinalizer(_restore_flag)
+
+    if not running:
+        logger.info("%s not running on %s; starting it for this session", relay_container, duthost.hostname)
+        request.addfinalizer(lambda: gpins_utils.stop_dhcp_relay(duthost))
+        py_assert(
+            gpins_utils.start_dhcp_relay(duthost, timeout=DHCP_RELAY_FEATURE_START_TIMEOUT),
+            "{} did not start within {}s ({} start)".format(
+                relay_container, DHCP_RELAY_FEATURE_START_TIMEOUT, gpins_utils.DHCP_RELAY_INIT_SCRIPT))
+
+    return "enabled"
 
 
 @pytest.fixture(scope="module", autouse=True)
-def check_dhcp_feature_status(duthost):
-    feature_status_output = duthost.show_and_parse("show feature status")
-    for feature in feature_status_output:
-        if feature["feature"] == "dhcp_relay" and feature["state"] != "enabled":
-            pytest.skip("dhcp_relay is not enabled")
+def check_dhcp_feature_status(duthost, dhcp_relay_feature_enabled):
+    """Skip every test in this directory unless DHCP relay is up on the DUT.
+
+    GPINS has no ``show`` CLI, so FEATURE|dhcp_relay is read straight from CONFIG_DB
+    and the container state from ``ctr tasks ls``.
+    Pass ``--dhcp_relay_enable_feature`` to bring it up for the session instead of skipping.
+    """
+    state = dhcp_relay_feature_enabled
+    if state != "enabled":
+        pytest.skip("dhcp_relay is not up (FEATURE|dhcp_relay state={!r}); "
+                    "pass --dhcp_relay_enable_feature to enable it for the session".format(state))
+
+
+@pytest.fixture(scope="session")
+def dhcp_relay_loopback_ipv6(request, duthost):
+    """Guarantee Loopback0 has an IPv6 address for the session (see gpins_utils.ensure_loopback_ipv6).
+
+    Verified on ju3u1m1 (2026-10-09): without it dhcp6relay exits 1 as soon as
+    Interface-ID is enabled ("Failed to create loopback listen socket"), which
+    Boyang's rule makes mandatory on LLA-only ports. Only touches the DUT when
+    Loopback0 has no IPv6; whatever it adds is removed at session end.
+    Returns the loopback's (address, prefixlen) or (None, None) if disabled.
+    """
+    wanted = request.config.getoption("--dhcp_relay_loopback_ipv6")
+    if wanted and wanted.lower() != "none":
+        created = gpins_utils.ensure_loopback_ipv6(duthost, wanted)
+        if created:
+            request.addfinalizer(lambda: gpins_utils.remove_loopback_ipv6(duthost, created))
+    return gpins_utils.get_loopback_ipv6(duthost)
+
+
+@pytest.fixture(scope="function")
+def dhcp_relay_config_snapshot(duthosts, rand_one_dut_hostname, dhcp_relay_config):
+    """Snapshot ``DHCP_RELAY|*`` around a GPINS test that rewrites it; restore and re-converge afterwards.
+
+    Depends on ``dhcp_relay_config`` (test_dhcpv6_relay.py, imported by the GPINS test modules) so the
+    baseline being snapshotted is the one the rest of the module runs against.
+    """
+    duthost = duthosts[rand_one_dut_hostname]
+    snapshot = gpins_utils.snapshot_config_db(duthost, ["DHCP_RELAY|*"])
+    yield snapshot
+    if not gpins_utils.is_container_running(duthost):
+        gpins_utils.start_dhcp_relay(duthost, timeout=120)
+    gpins_utils.restore_config_db(duthost, snapshot)
+    for key in snapshot["entries"]:
+        gpins_utils.assert_dhcp_relay_converged(duthost, key.split("|", 1)[1])
+    py_assert(gpins_utils.wait_dhcp6relay_bound(duthost),
+              "dhcp6relay not running/listening after restoring DHCP_RELAY config")
 
 
 @pytest.fixture(scope="module")
